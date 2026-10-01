@@ -45,6 +45,7 @@ extern "C" {
 #define DEBUG_FRAMES 0
 #define DEBUG_WORKQUEUE 0
 #define DEBUG_EXTRADATA 0
+#define DEBUG_VPP_TRACE 0
 
 #define ALIGN(A, B) (((A) + (B)-1) & ~(( B)-1))
 
@@ -99,6 +100,7 @@ C2FFMPEGVideoDecodeComponent::C2FFMPEGVideoDecodeComponent(
     mVppContextId = VA_INVALID_ID;
     mVppWidth = 0;
     mVppHeight = 0;
+    mTraceFrame = 0;
 #endif
 }
 
@@ -572,10 +574,30 @@ int C2FFMPEGVideoDecodeComponent::vaapi_vpp_convert(AVFrame *src, AVFrame *dst) 
     }
 
     // 5. Execute Blit
+    // The source surface may still be being decoded into: VAAPI gives no
+    // ordering between the decoder job and vaRenderPicture, so reading it
+    // without a sync yields garbage or a black frame. Wait for the decode to
+    // retire before using the surface as a blit source.
+    vas = vaSyncSurface(display, src_surface);
+    if (vas != VA_STATUS_SUCCESS) {
+        ALOGE("VPP: vaSyncSurface on source %#x failed: %x", src_surface, vas);
+        vaDestroyBuffer(display, pipeline_buf);
+        return AVERROR_EXTERNAL;
+    }
+
     vas = vaBeginPicture(display, mVppContextId, dst_surface);
     if (vas == VA_STATUS_SUCCESS) {
-        vaRenderPicture(display, mVppContextId, &pipeline_buf, 1);
-        vas = vaEndPicture(display, mVppContextId);
+        // vaRenderPicture reports per-surface failures, so a silent ignore
+        // here leaves the destination untouched (a black frame) with no hint
+        // as to why.
+        vas = vaRenderPicture(display, mVppContextId, &pipeline_buf, 1);
+        if (vas != VA_STATUS_SUCCESS) {
+            ALOGE("VPP: vaRenderPicture failed: %s (%d)", vaErrorStr(vas), vas);
+        } else {
+            vas = vaEndPicture(display, mVppContextId);
+        }
+    } else {
+        ALOGE("VPP: vaBeginPicture failed: %s (%d)", vaErrorStr(vas), vas);
     }
 
     // 6. Cleanup Per-Frame Resources
@@ -583,6 +605,18 @@ int C2FFMPEGVideoDecodeComponent::vaapi_vpp_convert(AVFrame *src, AVFrame *dst) 
 
     if (vas != VA_STATUS_SUCCESS) {
         ALOGE("VPP: Blit execution failed: %x", vas);
+        return AVERROR_EXTERNAL;
+    }
+
+    // Wait for the blit to retire while the source surface is still pinned.
+    // vaEndPicture only queues the work: once the caller releases the source
+    // frame the decoder may start the next picture into the same surface, and
+    // the GPU is free to run that decode before our blit reads it. That race
+    // shows up as randomly black frames.
+    vas = vaSyncSurface(display, dst_surface);
+    if (vas != VA_STATUS_SUCCESS) {
+        ALOGE("VPP: vaSyncSurface on destination %#x failed: %s (%d)",
+              dst_surface, vaErrorStr(vas), vas);
         return AVERROR_EXTERNAL;
     }
 
@@ -617,13 +651,32 @@ c2_status_t C2FFMPEGVideoDecodeComponent::receiveFrame(bool* hasPicture) {
     // Check if we are in the RGB Hardware mode
     bool isRGB = (mUtils->getPixelFormatType() != PixelFormatType::YUV_420);
 
+    // The VPP blit moves the YUV->RGB conversion to the GPU, which is what
+    // keeps 4K decoding within budget (no CPU detiling, no per-frame CPU
+    // colour conversion). It is separate from mUseDrmPrime: the decoder keeps
+    // using the FFmpeg VAAPI pool for its own surfaces, and only the output
+    // buffer is turned into a VA render target here.
     if (mCtx->hw_frames_ctx
-            && mUseDrmPrime
             && isRGB) {
         AVFrame* tempFrame = av_frame_alloc();
         int err = avcodec_receive_frame(mCtx, tempFrame);
             if (err == 0) {
                 bool isHW = (tempFrame->format == AV_PIX_FMT_VAAPI);
+#if DEBUG_VPP_TRACE
+                if ((mTraceFrame % 30) == 0) {
+                    ALOGD("VPPTRACE f=%d hw=%d fmt=%d held=%zd",
+                          mTraceFrame, (int)isHW, (int)tempFrame->format,
+                          mHeldSurfaces.size());
+                }
+                mTraceFrame++;
+                if (!isHW) {
+                    // A frame that is not a VAAPI surface cannot be blitted
+                    // and will go through the CPU path instead: that is a
+                    // correct picture but slow, so it must not be silent.
+                    ALOGD("VPPTRACE f=%d non-VA frame (fmt=%d), CPU path",
+                          mTraceFrame, (int)tempFrame->format);
+                }
+#endif
                 if (isHW) {
                     // --- TRUE HARDWARE VPP PATH ---
                     
@@ -1362,6 +1415,12 @@ c2_status_t C2FFMPEGVideoDecodeComponent::drain(
 void C2FFMPEGVideoDecodeComponent::SurfaceDescriptor::set(const std::shared_ptr<C2GraphicBlock>& block) {
     android::_UnwrapNativeCodec2GrallocMetadata(block->handle(),
             &width, &height, &format, &usage, &stride, &generation, &igbpId, &igbpSlot);
+    id = igbpId ? igbpId : (uint64_t)(uintptr_t)block->handle();
+    // Handle addresses get recycled by the allocator, so the id alone cannot
+    // tell two buffers apart. The dma-buf fd does: a recycled address belongs
+    // to a new allocation with a different fd, and a VA surface created for
+    // the old one must not be reused for it.
+    primeFd = block->handle() ? (int)block->handle()->data[0] : -1;
 }
 
 int C2FFMPEGVideoDecodeComponent::getBufferVAAPI(AVHWFramesContext* hwfc, AVFrame* frame, bool forceAllocator) {
@@ -1387,10 +1446,8 @@ int C2FFMPEGVideoDecodeComponent::getBufferVAAPI(AVHWFramesContext* hwfc, AVFram
     AVVAAPIDeviceContext* hwctx = (AVVAAPIDeviceContext*)hwfc->device_ctx->hwctx;
 
     if (mCtx->coded_width != mSurfaceWidth || mCtx->coded_height != mSurfaceHeight) {
-        ALOGD("getBufferVAAPI[%p]: set surface dimension to %d x %d, surfaces = %zd, held = %zd, pending = %zd, available = %zd",
-              hwfc, mCtx->coded_width, mCtx->coded_height, mSurfaces.size(), mHeldSurfaces.size(), mPendingSurfaces.size(), mAvailableSurfaces.size());
-        mPendingSurfaces.clear();
-        mAvailableSurfaces.clear();
+        ALOGD("getBufferVAAPI[%p]: set surface dimension to %d x %d, surfaces = %zd, held = %zd",
+              hwfc, mCtx->coded_width, mCtx->coded_height, mSurfaces.size(), mHeldSurfaces.size());
         mSurfaceWidth = mCtx->coded_width;
         mSurfaceHeight = mCtx->coded_height;
     }
@@ -1399,67 +1456,54 @@ int C2FFMPEGVideoDecodeComponent::getBufferVAAPI(AVHWFramesContext* hwfc, AVFram
     std::shared_ptr<C2GraphicBlock> block;
     SurfaceDescriptor desc;
 
-    while (!block) {
-        if (mAvailableSurfaces.empty()) {
-            err = mBlockPool->fetchGraphicBlock(mSurfaceWidth, mSurfaceHeight, mUtils->getPixelFormat(true),
-                                                { mIntf->getConsumerUsage(), (uint64_t)BufferUsage::VIDEO_DECODER }, &block);
-            if (err != C2_OK) {
-                ALOGE("getBufferVAAPI[%p]: failed to fetch graphic block %d x %d (%#x) err = %d",
-                      hwfc, mSurfaceWidth, mSurfaceHeight, mUtils->getPixelFormat(true), err);
-                return AVERROR(ENOMEM);
-            }
-            desc.set(block);
-
-            auto s_it = mSurfaces.find(desc.getId());
-            if (s_it != mSurfaces.end()) {
-                auto h_it = mHeldSurfaces.find(s_it->second.surfaceId);
-                if (h_it != mHeldSurfaces.end()) {
-                    if (h_it->second) {
-                        // The driver is reusing a surface ID that we thought was still busy.
-                        // Trust the driver/FFmpeg and clear our stale reference.
-                        ALOGW("getBufferVAAPI[%p]: Surface %#x reused by driver, clearing stale block.", 
-                              hwfc, h_it->first);
-                        h_it->second.reset(); 
-                    }
-
-                    if (mPendingSurfaces.find(h_it->first) != mPendingSurfaces.end()) {
-                         // Also clear pending if it exists
-                         mPendingSurfaces.erase(h_it->first);
-                    }
-#if DEBUG_FRAMES
-                    ALOGD("getBufferVAAPI[%p]: saving pending block for surface %#x.",
-                          hwfc, h_it->first);
-#endif
-                    mPendingSurfaces.emplace(h_it->first, std::move(block));
-                }
-            }
-        } else {
-            auto a_it = mAvailableSurfaces.begin();
-#if DEBUG_FRAMES
-            ALOGD("getBufferVAAPI[%p]: using available block for surface %#x.", hwfc, a_it->first);
-#endif
-            block = std::move(a_it->second);
-            mAvailableSurfaces.erase(a_it);
-            desc.set(block);
-        }
+    // The gralloc pool is the single owner of the buffers: a block fetched
+    // here is only handed back once every reference to it is gone, which
+    // includes the C2 output buffer still held by the consumer. Recycling
+    // it earlier would rewrite a frame that SurfaceFlinger is displaying.
+    err = mBlockPool->fetchGraphicBlock(mSurfaceWidth, mSurfaceHeight, mUtils->getPixelFormat(true),
+                                        { mIntf->getConsumerUsage(), (uint64_t)BufferUsage::VIDEO_DECODER }, &block);
+    if (err != C2_OK) {
+        ALOGE("getBufferVAAPI[%p]: failed to fetch graphic block %d x %d (%#x) err = %d",
+              hwfc, mSurfaceWidth, mSurfaceHeight, mUtils->getPixelFormat(true), err);
+        return AVERROR(ENOMEM);
     }
+    desc.set(block);
+
+#if DEBUG_VPP_TRACE
+    ALOGD("VPPTRACE getBlock id=%llu stride=%d held=%zd surfaces=%zd",
+          (unsigned long long)desc.getId(), desc.stride, mHeldSurfaces.size(), mSurfaces.size());
+#endif
 
     VASurfaceID surfaceId;
     VAStatus vas;
 
     auto s_it = mSurfaces.find(desc.getId());
     if (s_it != mSurfaces.end()) {
+        bool stale = false;
         if (s_it->second.width != mSurfaceWidth || s_it->second.height != mSurfaceHeight) {
+            stale = true;
+        }
+        // The surface is bound to one dma-buf. A recycled handle address with a
+        // different fd is a different allocation, and reusing the surface would
+        // leave it pointing at memory the consumer no longer owns.
+        if (s_it->second.primeFd != desc.primeFd) {
+            ALOGD("getBufferVAAPI[%p]: surface %#x for buffer %llu now uses fd %d, was %d, recreating",
+                  hwfc, s_it->second.surfaceId, (unsigned long long)desc.getId(),
+                  desc.primeFd, s_it->second.primeFd);
+            stale = true;
+        }
+        if (stale) {
 #if DEBUG_FRAMES
-            ALOGD("getBufferVAAPI[%p]: destroying incompatible surface %#x (%d x %d) for buffer %d (%d x %d).",
+            ALOGD("getBufferVAAPI[%p]: destroying incompatible surface %#x (%d x %d) for buffer %llu (%d x %d).",
                   hwfc, s_it->second.surfaceId, s_it->second.width, s_it->second.height,
-                  desc.getId(), desc.width, desc.height);
+                  (unsigned long long)desc.getId(), desc.width, desc.height);
 #endif
             vas = vaDestroySurfaces(hwctx->display, &s_it->second.surfaceId, 1);
             if (vas != VA_STATUS_SUCCESS) {
                 ALOGE("getBufferVAAPI[%p]: failed to destroy surface %#x: %s (%d).",
                       hwfc, s_it->second.surfaceId, vaErrorStr(vas), vas);
             }
+            mHeldSurfaces.erase(s_it->second.surfaceId);
             mSurfaces.erase(s_it);
             s_it = mSurfaces.end();
         }
@@ -1468,7 +1512,7 @@ int C2FFMPEGVideoDecodeComponent::getBufferVAAPI(AVHWFramesContext* hwfc, AVFram
     if (s_it == mSurfaces.end()) {
         int bufferPrimeFd = static_cast<int>(block->handle()->data[0]);
 
-        VADRMPRIMESurfaceDescriptor descriptor;
+        VADRMPRIMESurfaceDescriptor descriptor = {};
         VASurfaceAttrib attributes[2] = {
             {
                 .type = VASurfaceAttribMemoryType,
@@ -1504,6 +1548,11 @@ int C2FFMPEGVideoDecodeComponent::getBufferVAAPI(AVHWFramesContext* hwfc, AVFram
 
             memcpy(descriptor.layers[0].offset, crosHandle->offsets, sizeof(descriptor.layers[0].offset));
             memcpy(descriptor.layers[0].pitch, crosHandle->strides, sizeof(descriptor.layers[0].pitch));
+
+            // All planes live in the single DRM object referenced by objects[0].
+            for (uint32_t p = 0; p < descriptor.layers[0].num_planes && p < 4; p++) {
+                descriptor.layers[0].object_index[p] = 0;
+            }
         } else {
             // Determine Bytes Per Pixel (BPP)
             int bpp = 1;
@@ -1548,14 +1597,32 @@ int C2FFMPEGVideoDecodeComponent::getBufferVAAPI(AVHWFramesContext* hwfc, AVFram
         }
 
 #if DEBUG_FRAMES
-        ALOGD("getBufferVAAPI[%p]: created surface %#x (%d x %d) for buffer %d",
-              hwfc, surfaceId, mSurfaceWidth, mSurfaceHeight, desc.getId());
+        ALOGD("getBufferVAAPI[%p]: created surface %#x (%d x %d) for buffer %llu",
+              hwfc, surfaceId, mSurfaceWidth, mSurfaceHeight, (unsigned long long)desc.getId());
 #endif
 
         desc.surfaceId = surfaceId;
         mSurfaces.emplace(desc.getId(), desc);
     } else {
         surfaceId = s_it->second.surfaceId;
+#if DEBUG_VPP_TRACE
+        ALOGD("VPPTRACE reuse surface=%#x for buffer=%llu", surfaceId, (unsigned long long)desc.getId());
+#endif
+    }
+
+    // Each surface pins a full resolution allocation, and buffer identities
+    // churn over time, so drop the ones that are not in use before this grows
+    // without bound.
+    if (mSurfaces.size() > 32) {
+        for (auto it = mSurfaces.begin(); it != mSurfaces.end(); ) {
+            if (it->second.surfaceId == surfaceId ||
+                mHeldSurfaces.count(it->second.surfaceId) != 0) {
+                ++it;
+                continue;
+            }
+            vaDestroySurfaces(hwctx->display, &it->second.surfaceId, 1);
+            it = mSurfaces.erase(it);
+        }
     }
 
     frame->buf[0] = av_buffer_create((uint8_t*)(uintptr_t)surfaceId, 0,
@@ -1570,40 +1637,30 @@ int C2FFMPEGVideoDecodeComponent::getBufferVAAPI(AVHWFramesContext* hwfc, AVFram
     frame->width = hwfc->width;
     frame->height = hwfc->height;
 
-    mHeldSurfaces.emplace(surfaceId, std::move(block));
+    // Assign instead of emplace: the surface may already be present as a
+    // stale null entry (see the reuse path above), and emplace would keep
+    // that null and drop the block we just fetched.
+    mHeldSurfaces[surfaceId] = std::move(block);
 
 #if DEBUG_FRAMES
-    ALOGD("getBufferVAAPI[%p]: using surface %#x (%d x %d) for buffer %d, held = %zd",
-          hwfc, surfaceId, mSurfaceWidth, mSurfaceHeight, desc.getId(), mHeldSurfaces.size());
+    ALOGD("getBufferVAAPI[%p]: using surface %#x (%d x %d) for buffer %llu, held = %zd",
+          hwfc, surfaceId, mSurfaceWidth, mSurfaceHeight, (unsigned long long)desc.getId(), mHeldSurfaces.size());
 #endif
 
     return 0;
 }
 
 void C2FFMPEGVideoDecodeComponent::releaseBufferVAAPI(VASurfaceID surfaceId) {
-    if (mHeldSurfaces.size() == 0) return;
-
-    auto it = mHeldSurfaces.find(surfaceId);
-
-    if (it == mHeldSurfaces.end()) {
-        ALOGE("releaseBufferVAAPI: surface %#x not found (already released?)", surfaceId);
-        return;
-    }
-    mHeldSurfaces.erase(it);
+    // FFmpeg is done with the surface. Dropping our reference is all that is
+    // needed: the underlying gralloc block stays alive until the consumer
+    // releases the C2 output buffer, and only then does the pool hand it out
+    // again. Do not cache it here, that would recycle a frame that is still
+    // on screen.
+    mHeldSurfaces.erase(surfaceId);
 
 #if DEBUG_FRAMES
     ALOGD("releaseBufferVAAPI: released surface %#x.", surfaceId);
 #endif
-
-    auto p_it = mPendingSurfaces.find(surfaceId);
-
-    if (p_it != mPendingSurfaces.end()) {
-#if DEBUG_FRAMES
-    ALOGD("releaseBufferVAAPI: pending block for surface %#x is now available.", surfaceId);
-#endif
-        mAvailableSurfaces.emplace(surfaceId, std::move(p_it->second));
-        mPendingSurfaces.erase(p_it);
-    }
 }
 
 std::shared_ptr<C2Buffer> C2FFMPEGVideoDecodeComponent::getOutputBufferVAAPI() {
@@ -1622,7 +1679,34 @@ std::shared_ptr<C2Buffer> C2FFMPEGVideoDecodeComponent::getOutputBufferVAAPI() {
     vaSyncSurface(hwctx->display, surfaceId);
     block = std::move(it->second);
 
-    return createGraphicBuffer(std::move(block), C2Rect(mFrame->width, mFrame->height));
+#if DEBUG_VPP_TRACE
+    // SurfaceDescriptor::getId() is the id used to build the VA surface, so
+    // printing the handle of the block that is actually handed over tells us
+    // whether the blitted buffer is the one the compositor will read.
+    ALOGD("VPPTRACE output surface=%#x blockHandle=%p fd=%d",
+          surfaceId, (void*)block->handle(),
+          block->handle() ? (int)block->handle()->data[0] : -1);
+#endif
+
+    std::shared_ptr<C2Buffer> out = createGraphicBuffer(std::move(block),
+                                                        C2Rect(mFrame->width, mFrame->height));
+
+    // Drop the VA surface right away instead of caching it. Buffer identity is
+    // not reliably recoverable here: the allocator recycles both handle
+    // addresses and fd numbers, so a cached surface can end up bound to memory
+    // that now belongs to a different buffer, and the frames then come out
+    // shuffled. The render is already synced above, so tearing the surface down
+    // here cannot affect the pixels the consumer is about to read.
+    for (auto it = mSurfaces.begin(); it != mSurfaces.end(); ++it) {
+        if (it->second.surfaceId == surfaceId) {
+            vaDestroySurfaces(hwctx->display, &it->second.surfaceId, 1);
+            mSurfaces.erase(it);
+            break;
+        }
+    }
+    mHeldSurfaces.erase(surfaceId);
+
+    return out;
 }
 
 void C2FFMPEGVideoDecodeComponent::deInitDecoderVAAPI() {
@@ -1631,8 +1715,6 @@ void C2FFMPEGVideoDecodeComponent::deInitDecoderVAAPI() {
     VAStatus vas;
 
     mHeldSurfaces.clear();
-    mPendingSurfaces.clear();
-    mAvailableSurfaces.clear();
     for (auto& entry : mSurfaces) {
         vas = vaDestroySurfaces(hwctx->display, &entry.second.surfaceId, 1);
         if (vas != VA_STATUS_SUCCESS) {

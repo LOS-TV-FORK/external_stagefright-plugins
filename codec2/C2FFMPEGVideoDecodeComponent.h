@@ -130,18 +130,26 @@ private:
         uint32_t generation;
         uint32_t igbpSlot;
         uint64_t igbpId;
+        uint64_t id;
+        int primeFd;
         VASurfaceID surfaceId;
 
-        int getId() const { return igbpSlot; }
+        // A VA surface is bound to one specific dma-buf, so this must
+        // identify the buffer, not the queue slot: the gralloc metadata leaves
+        // igbpSlot at 0 here, which collapsed every buffer onto a single
+        // surface and made the blit write into a buffer the consumer never
+        // received. Prefer the BufferQueue's unique buffer id and fall back to
+        // the identity of the native handle, which is unique for as long as
+        // the buffer is alive.
+        uint64_t getId() const { return id; }
         void set(const std::shared_ptr<C2GraphicBlock>& block);
     };
 
     std::shared_ptr<C2BlockPool> mBlockPool;
-    std::unordered_map<int, SurfaceDescriptor> mSurfaces;
+    std::unordered_map<uint64_t, SurfaceDescriptor> mSurfaces;
     std::unordered_map<VASurfaceID, std::shared_ptr<C2GraphicBlock>> mHeldSurfaces;
-    std::unordered_map<VASurfaceID, std::shared_ptr<C2GraphicBlock>> mPendingSurfaces;
-    std::unordered_map<VASurfaceID, std::shared_ptr<C2GraphicBlock>> mAvailableSurfaces;
     int mSurfaceWidth;
+    int mTraceFrame;
     int mSurfaceHeight;
 #endif
 };
